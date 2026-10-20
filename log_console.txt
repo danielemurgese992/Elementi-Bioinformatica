@@ -1,0 +1,599 @@
+
+> #### [SEZ: header]
+> ###############################################################################
+> #  Elaborato di Elementi di Bioinformatica
+> #  Analisi di geni differenzialmente espressi (DEG)
+> #  Dataset : GEO GSE32863 - Adenocarcinoma polmonare (LUAD) vs tessuto
+> #            polmonare adiacente non tumorale (matched-normal)
+> #  Piattaforma: GPL6884 - Illumina HumanWG-6 v3.0 expression beadchip
+> #  Linguaggio : R (>= 4.2) + Bioconductor
+> ###############################################################################
+> 
+> #### [SEZ: setup]
+> ## ---- 0. SETUP: pacchetti, parametri, cartelle ---------------------------
+> # Installazione (da eseguire una sola volta):
+> # if (!requireNamespace("BiocManager", quietly = TRUE))
+> #   install.packages("BiocManager")
+> # BiocManager::install(c("GEOquery", "Biobase"))
+> # install.packages(c("ggplot2", "ggrepel", "pheatmap", "RColorBrewer",
+> #                    "matrixStats", "dplyr", "tidyr", "gridExtra", "enrichR"))
+> 
+> suppressPackageStartupMessages({
++   library(GEOquery)      # download e parsing dei dati GEO
++   library(Biobase)       # classe ExpressionSet (exprs, pData, fData)
++   library(matrixStats)   # statistiche per riga veloci (rowIQRs, ...)
++   library(ggplot2)       # grafici
++   library(ggrepel)       # etichette non sovrapposte nel volcano plot
++   library(pheatmap)      # heatmap con clustering gerarchico
++   library(RColorBrewer)  # palette di colori
++   library(dplyr)         # manipolazione tabelle
++   library(tidyr)         # formato long/wide
++   library(gridExtra)     # composizione di piu grafici
++ })
+
+> set.seed(123)                 # riproducibilita
+
+> GSE_ID   <- "GSE32863"        # identificativo della serie GEO
+
+> DATA_DIR <- "data"            # cartella per i file scaricati
+
+> OUT_DIR  <- "output"          # cartella per grafici e risultati
+
+> dir.create(DATA_DIR, showWarnings = FALSE)
+
+> dir.create(OUT_DIR,  showWarnings = FALSE)
+
+> IQR_PERC <- 0.10   # percentile della distribuzione IQR sotto cui scartare
+
+> FC_THR   <- 2      # soglia di fold-change lineare -> |logFC| >= log2(2) = 1
+
+> ALPHA    <- 0.05   # soglia sul p-value aggiustato (FDR)
+
+> options(timeout = 1200)       # download lenti
+
+> # funzione di utilita per salvare i grafici ggplot in PNG
+> save_plot <- function(p, file, w = 8, h = 6) {
++   ggsave(file.path(OUT_DIR, file), p, width = w, height = h, dpi = 150)
++ }
+
+> #### [SEZ: download]
+> ## ---- 1. DOWNLOAD E IMPORTAZIONE DEI DATI ---------------------------------
+> # getGEO scarica il file "Series Matrix" (dati gia normalizzati dagli autori)
+> # e, con getGPL = TRUE, la tabella di annotazione della piattaforma GPL6884.
+> gse_list <- getGEO(GSE_ID, GSEMatrix = TRUE, getGPL = TRUE,
++                    destdir = DATA_DIR)
+
+> length(gse_list)              # una sola piattaforma -> lista di lunghezza 1
+[1] 1
+
+> gse  <- gse_list[[1]]         # oggetto ExpressionSet
+
+> expr <- exprs(gse)            # matrice sonde x campioni
+
+> pd   <- pData(gse)            # metadati dei campioni (phenoData)
+
+> fd   <- fData(gse)            # annotazione delle sonde (featureData)
+
+> cat("Sonde:", nrow(expr), " - Campioni:", ncol(expr), "\n")
+Sonde: 48803  - Campioni: 116 
+
+> print(expr[1:5, 1:4])         # prime righe/colonne della matrice
+             GSM813411 GSM813412 GSM813413 GSM813414
+ILMN_1343291 15.110861 15.394031 15.661410 15.888718
+ILMN_1343295 11.554970 12.579520 12.498511 13.576379
+ILMN_1651199  6.894616  6.787558  6.842807  6.870847
+ILMN_1651209  7.018983  7.101346  6.814281  6.822430
+ILMN_1651210  6.974386  6.893763  6.938241  6.686201
+
+> print(summary(as.vector(expr)))
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  6.340   6.865   6.970   7.569   7.597  16.051 
+
+> print(colnames(fd))           # colonne disponibili per l'annotazione
+ [1] "ID"                    "Species"               "Source"               
+ [4] "Search_Key"            "Transcript"            "ILMN_Gene"            
+ [7] "Source_Reference_ID"   "RefSeq_ID"             "Unigene_ID"           
+[10] "Entrez_Gene_ID"        "GI"                    "Accession"            
+[13] "Symbol"                "Protein_Product"       "Array_Address_Id"     
+[16] "Probe_Type"            "Probe_Start"           "SEQUENCE"             
+[19] "Chromosome"            "Probe_Chr_Orientation" "Probe_Coordinates"    
+[22] "Cytoband"              "Definition"            "Ontology_Component"   
+[25] "Ontology_Process"      "Ontology_Function"     "Synonyms"             
+[28] "GB_ACC"               
+
+> #### [SEZ: clinica]
+> ## ---- 2. DESCRIZIONE DEL DATASET E CARATTERISTICHE CLINICHE -----------------
+> # Le caratteristiche cliniche sono nelle colonne di pData che terminano
+> # con ":ch1" (derivano dai campi "characteristics_ch1" di GEO).
+> clin_cols <- grep(":ch1$", colnames(pd), value = TRUE)
+
+> clin <- pd[, clin_cols, drop = FALSE]
+
+> colnames(clin) <- make.names(sub(":ch1$", "", clin_cols))
+
+> # Gruppo (Tumor / Normal) e identificativo del paziente ricavati dal titolo:
+> # "Lung adenocarcinoma 05L12_T (expression)"
+> # "Adjacent non-tumor lung tissue 05L12_N (expression)"
+> clin$group   <- ifelse(grepl("non-tumor", pd$title, ignore.case = TRUE),
++                        "Normal", "Tumor")
+
+> clin$patient <- sub("^.* (\\S+)_[TN] \\(expression\\)$", "\\1", pd$title)
+
+> rownames(clin) <- rownames(pd)
+
+> print(table(clin$group))
+
+Normal  Tumor 
+    58     58 
+
+> str(clin)
+'data.frame':	116 obs. of  23 variables:
+ $ age                 : chr  "66" "66" "74" "74" ...
+ $ batch               : chr  "Batch 2" "Batch 2" "Batch 1" "Batch 1" ...
+ $ beadchip            : chr  "8" "8" "8" "4" ...
+ $ beadstrip           : chr  "E" "D" "L" "G" ...
+ $ bisulfite.alu       : chr  "12.16426" "15.05278" "15.03258" "16.09239" ...
+ $ bisulfite.plate     : chr  "32" "32" "31" "31" ...
+ $ egfr.mutation.status: chr  NA "MUT" NA "MUT" ...
+ $ ethnicity           : chr  "Asian" "Asian" "Asian" "Asian" ...
+ $ gender              : chr  "Male" "Male" "Male" "Male" ...
+ $ kras.mutation.status: chr  NA "WT" NA "WT" ...
+ $ kras.mutation.type  : chr  NA "WT" NA "WT" ...
+ $ lkb1.mutation.status: chr  NA "WT" NA "WT" ...
+ $ pack.years          : chr  "0" "0" "0" "0" ...
+ $ recurrence          : chr  "Yes" "Yes" "Yes" "Yes" ...
+ $ sample.id           : chr  "N7" "T7" "N8" "T8" ...
+ $ smoking.status      : chr  "Never" "Never" "Never" "Never" ...
+ $ Stage               : chr  "Stage IIIA" "Stage IIIA" "Stage IB" "Stage IB" ...
+ $ subject             : chr  "05L12" "05L12" "05L13" "05L13" ...
+ $ tissue.source       : chr  "nci-edrn" "nci-edrn" "nci-edrn" "nci-edrn" ...
+ $ tissue              : chr  "Normal lung" "Lung tumor" "Normal lung" "Lung tumor" ...
+ $ type                : chr  "Adjacent non-tumor lung tissue" "Lung adenocarcinoma" "Adjacent non-tumor lung tissue" "Lung adenocarcinoma" ...
+ $ group               : chr  "Normal" "Tumor" "Normal" "Tumor" ...
+ $ patient             : chr  "05L12" "05L12" "05L13" "05L13" ...
+
+> # Le variabili cliniche si riferiscono al paziente: per non contarle due
+> # volte si usano solo i campioni tumorali (uno per paziente).
+> clin_pat <- clin[clin$group == "Tumor", ]
+
+> plot_var <- function(df, v) {
++   x <- df[[v]]
++   xn <- suppressWarnings(as.numeric(as.character(x)))
++   if (sum(!is.na(xn)) > 0.8 * length(x) && length(unique(xn)) > 10) {
++     # variabile numerica continua (es. eta) -> istogramma
++     ggplot(data.frame(val = xn), aes(val)) +
++       geom_histogram(bins = 15, fill = "#2E75B6", colour = "white") +
++       labs(title = v, x = v, y = "N. pazienti") + theme_bw()
++   } else {
++     # variabile categorica -> barplot delle frequenze
++     ggplot(data.frame(val = factor(x)), aes(val)) +
++       geom_bar(fill = "#C55A11") +
++       geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.3) +
++       labs(title = v, x = NULL, y = "N. pazienti") + theme_bw() +
++       theme(axis.text.x = element_text(angle = 30, hjust = 1))
++   }
++ }
+
+> # variabili da rappresentare: escludo identificativi e colonne costanti
+> vars <- setdiff(colnames(clin_pat), c("group", "patient"))
+
+> vars <- vars[sapply(clin_pat[vars], function(z) {
++   k <- length(unique(z)); k > 1 && k < nrow(clin_pat) })]
+
+> vars <- unique(c(vars, grep("age", colnames(clin_pat), value = TRUE,
++                             ignore.case = TRUE)))
+
+> plots <- lapply(vars, function(v) plot_var(clin_pat, v))
+
+> if (length(plots) > 0) {
++   g <- arrangeGrob(grobs = plots, ncol = 2)
++   ggsave(file.path(OUT_DIR, "01_caratteristiche_cliniche.png"), g,
++          width = 10, height = 3.5 * ceiling(length(plots) / 2), dpi = 150)
++ }
+
+> # barplot della numerosita dei gruppi
+> p_grp <- ggplot(clin, aes(group, fill = group)) + geom_bar() +
++   geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.3) +
++   scale_fill_manual(values = c(Normal = "#2E75B6", Tumor = "#C00000")) +
++   labs(title = "Campioni per gruppo", x = NULL, y = "N. campioni") +
++   theme_bw() + theme(legend.position = "none")
+
+> save_plot(p_grp, "02_campioni_per_gruppo.png", 5, 4)
+
+> #### [SEZ: gruppi]
+> ## ---- 3. ESTRAZIONE DEI CAMPIONI DA CONFRONTARE: CASI vs CONTROLLI ----------
+> grp  <- factor(clin$group, levels = c("Normal", "Tumor"))  # Normal = riferimento
+
+> case <- grp == "Tumor"     # vettore logico dei casi
+
+> ctrl <- grp == "Normal"    # vettore logico dei controlli
+
+> cat("Casi (Tumor):", sum(case), " - Controlli (Normal):", sum(ctrl), "\n")
+Casi (Tumor): 58  - Controlli (Normal): 58 
+
+> # coppie complete paziente tumore/normale (servono per l'analisi appaiata)
+> paired_ids <- intersect(clin$patient[case], clin$patient[ctrl])
+
+> cat("Pazienti con entrambi i campioni:", length(paired_ids), "\n")
+Pazienti con entrambi i campioni: 57 
+
+> #### [SEZ: log]
+> ## ---- 4. PRE-ELABORAZIONE (a): TRASFORMAZIONE log2(x + 1) -------------------
+> expr <- expr[complete.cases(expr), ]          # rimozione sonde con NA
+
+> if (min(expr) < 0) {                          # Illumina: possibili valori
++   cat("Valori negativi:", sum(expr < 0), "-> posti a 0\n")  # negativi dopo
++   expr[expr < 0] <- 0                         # sottrazione del background
++ }
+
+> if (max(expr) > 50) {
++   logexpr <- log2(expr + 1)                   # dati in scala lineare
++ } else {
++   # i dati risultano gia in scala log2: una seconda trasformazione
++   # comprimerebbe artificialmente la variabilita
++   message("Dati gia in scala logaritmica: trasformazione non riapplicata")
++   logexpr <- expr
++ }
+
+> print(summary(as.vector(logexpr)))
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  6.340   6.865   6.970   7.569   7.597  16.051 
+
+> # controllo qualita: distribuzione dei valori per campione
+> long <- data.frame(sample = rep(colnames(logexpr), each = nrow(logexpr)),
++                    value  = as.vector(logexpr),
++                    group  = rep(as.character(grp), each = nrow(logexpr)))
+
+> p_box <- ggplot(long, aes(sample, value, fill = group)) +
++   geom_boxplot(outlier.size = 0.2, linewidth = 0.2) +
++   scale_fill_manual(values = c(Normal = "#2E75B6", Tumor = "#C00000")) +
++   labs(title = "Distribuzione dell'espressione log2 per campione",
++        x = "Campioni", y = "log2(espressione + 1)") +
++   theme_bw() + theme(axis.text.x = element_blank(),
++                      axis.ticks.x = element_blank())
+
+> save_plot(p_box, "03_boxplot_campioni_log2.png", 12, 5)
+
+> #### [SEZ: iqr]
+> ## ---- 5. PRE-ELABORAZIONE (b): FILTRO SULL'INTERVALLO INTERQUARTILE ---------
+> iqr <- rowIQRs(logexpr)                      # IQR = Q3 - Q1 per ogni sonda
+
+> names(iqr) <- rownames(logexpr)
+
+> iqr_thr <- quantile(iqr, probs = IQR_PERC)   # soglia al percentile scelto
+
+> cat("Soglia IQR (", IQR_PERC * 100, "deg percentile):", round(iqr_thr, 4), "\n")
+Soglia IQR ( 10 deg percentile): 0.0805 
+
+> p_iqr <- ggplot(data.frame(iqr = iqr), aes(iqr)) +
++   geom_histogram(bins = 100, fill = "grey60", colour = "grey30") +
++   geom_vline(xintercept = iqr_thr, colour = "red", linewidth = 1,
++              linetype = "dashed") +
++   annotate("text", x = iqr_thr, y = Inf, vjust = 2, hjust = -0.05,
++            label = paste0(IQR_PERC * 100, " percentile = ",
++                           round(iqr_thr, 3)), colour = "red") +
++   labs(title = "Distribuzione dell'IQR delle sonde",
++        x = "IQR (scala log2)", y = "Frequenza") + theme_bw()
+
+> save_plot(p_iqr, "04_istogramma_IQR.png", 8, 5)
+
+> keep <- iqr > iqr_thr
+
+> filt <- logexpr[keep, ]
+
+> cat("Sonde prima:", nrow(logexpr), " - dopo filtro IQR:", nrow(filt), "\n")
+Sonde prima: 48803  - dopo filtro IQR: 43922 
+
+> #### [SEZ: annot]
+> ## ---- 6. ANNOTAZIONE: DA SONDA A SIMBOLO GENICO ----------------------------
+> # Piu sonde possono mappare lo stesso gene: si conserva quella con IQR
+> # maggiore (la piu informativa); si scartano le sonde senza simbolo.
+> sym_col <- intersect(c("Symbol", "ILMN_Gene", "Gene symbol", "GENE_SYMBOL"),
++                      colnames(fd))[1]
+
+> ann <- data.frame(probe  = rownames(filt),
++                   symbol = as.character(fd[rownames(filt), sym_col]),
++                   iqr    = iqr[rownames(filt)],
++                   stringsAsFactors = FALSE)
+
+> ann <- ann[!is.na(ann$symbol) & ann$symbol != "", ]
+
+> ann <- ann[order(ann$symbol, -ann$iqr), ]
+
+> ann <- ann[!duplicated(ann$symbol), ]
+
+> gexpr <- filt[ann$probe, ]
+
+> rownames(gexpr) <- ann$symbol
+
+> cat("Geni unici dopo il collasso delle sonde:", nrow(gexpr), "\n")
+Geni unici dopo il collasso delle sonde: 23949 
+
+> #### [SEZ: test]
+> ## ---- 7. FILTRAGGIO: logFC, TEST t, CORREZIONE FDR --------------------------
+> # logFC: i dati sono in scala log2, quindi il rapporto diventa differenza
+> logFC <- rowMeans(gexpr[, case]) - rowMeans(gexpr[, ctrl])
+
+> # n = 58 per gruppo (> 30): per il teorema del limite centrale la media
+> # campionaria e approssimativamente normale -> test t a due campioni.
+> # Si usa la variante di Welch (varianze non assunte uguali).
+> pval <- apply(gexpr, 1, function(x)
++   t.test(x[case], x[ctrl], var.equal = FALSE)$p.value)
+
+> # correzione per test multipli: False Discovery Rate di Benjamini-Hochberg
+> padj <- p.adjust(pval, method = "BH")
+
+> res <- data.frame(Gene = rownames(gexpr), logFC = logFC,
++                   AveExpr = rowMeans(gexpr), P.Value = pval,
++                   adj.P.Val = padj, stringsAsFactors = FALSE)
+
+> res <- res[order(res$adj.P.Val), ]
+
+> print(head(res, 10))
+           Gene     logFC   AveExpr      P.Value    adj.P.Val
+ADH1B     ADH1B -2.669429  8.610002 9.963749e-57 2.386218e-52
+FMO2       FMO2 -3.119344 10.048327 5.116938e-53 6.127277e-49
+AGER       AGER -4.309434 10.129525 8.537749e-53 6.815685e-49
+CLEC3B   CLEC3B -3.670355  9.930334 1.484135e-52 8.885887e-49
+FAM107A FAM107A -3.865324  9.835456 1.051516e-51 5.036549e-48
+ITLN2     ITLN2 -3.915571  9.183044 3.880835e-48 1.549035e-44
+STX11     STX11 -2.358300  8.969358 5.582577e-48 1.909959e-44
+TCF21     TCF21 -3.211707  9.213302 8.091488e-47 2.422288e-43
+JAM2       JAM2 -1.878174  8.548459 9.283722e-47 2.470398e-43
+PLAC9     PLAC9 -3.073043  9.913836 2.330361e-46 5.073619e-43
+
+> cat("Geni con FDR <", ALPHA, ":", sum(res$adj.P.Val < ALPHA), "\n")
+Geni con FDR < 0.05 : 11495 
+
+> # istogramma dei p-value grezzi (diagnostica: picco vicino a 0 = segnale)
+> p_ph <- ggplot(res, aes(P.Value)) +
++   geom_histogram(bins = 50, fill = "#7F7F7F", colour = "white") +
++   labs(title = "Distribuzione dei p-value (test t di Welch)",
++        x = "p-value", y = "Frequenza") + theme_bw()
+
+> save_plot(p_ph, "05_istogramma_pvalue.png", 7, 4.5)
+
+> #### [SEZ: volcano]
+> ## ---- 8. VOLCANO PLOT E APPLICAZIONE DELLE SOGLIE ---------------------------
+> lfc_thr <- log2(FC_THR)      # soglia sul logFC (1 se FC_THR = 2)
+
+> res$Regulation <- "NS"
+
+> res$Regulation[res$logFC >=  lfc_thr & res$adj.P.Val < ALPHA] <- "Up"
+
+> res$Regulation[res$logFC <= -lfc_thr & res$adj.P.Val < ALPHA] <- "Down"
+
+> print(table(res$Regulation))
+
+ Down    NS    Up 
+  784 22585   580 
+
+> top_lab <- rbind(head(res[res$Regulation == "Up", ][
++                    order(-res$logFC[res$Regulation == "Up"]), ], 10),
++                  head(res[res$Regulation == "Down", ][
++                    order(res$logFC[res$Regulation == "Down"]), ], 10))
+
+> p_vol <- ggplot(res, aes(logFC, -log10(adj.P.Val), colour = Regulation)) +
++   geom_point(size = 0.8, alpha = 0.6) +
++   scale_colour_manual(values = c(Down = "#2E75B6", NS = "grey70",
++                                  Up = "#C00000")) +
++   geom_vline(xintercept = c(-lfc_thr, lfc_thr), linetype = "dashed") +
++   geom_hline(yintercept = -log10(ALPHA), linetype = "dashed") +
++   geom_text_repel(data = top_lab, aes(label = Gene), size = 3,
++                   max.overlaps = 30, show.legend = FALSE) +
++   labs(title = "Volcano plot - LUAD vs tessuto normale",
++        x = "log2 Fold Change (Tumor - Normal)",
++        y = "-log10(p-value aggiustato FDR)") + theme_bw()
+
+> save_plot(p_vol, "06_volcano_plot.png", 9, 7)
+
+> # sottoinsieme finale dei geni differenzialmente espressi (DEG)
+> deg <- res[res$Regulation != "NS", ]
+
+> deg <- deg[order(-abs(deg$logFC)), ]
+
+> cat("DEG totali:", nrow(deg), " - Up:", sum(deg$Regulation == "Up"),
++     " - Down:", sum(deg$Regulation == "Down"), "\n")
+DEG totali: 1364  - Up: 580  - Down: 784 
+
+> #### [SEZ: boxplot]
+> ## ---- 9. BOXPLOT DEL GENE PIU UP-REGOLATO E PIU DOWN-REGOLATO --------------
+> g_up   <- deg$Gene[which.max(deg$logFC)]
+
+> g_down <- deg$Gene[which.min(deg$logFC)]
+
+> cat("Gene piu up-regolato:", g_up, " - piu down-regolato:", g_down, "\n")
+Gene piu up-regolato: SPP1  - piu down-regolato: CLDN18 
+
+> bx <- data.frame(Expression = c(gexpr[g_up, ], gexpr[g_down, ]),
++                  Gene  = rep(c(paste(g_up, "(UP)"), paste(g_down, "(DOWN)")),
++                              each = ncol(gexpr)),
++                  Group = rep(as.character(grp), 2))
+
+> p_bx <- ggplot(bx, aes(Group, Expression, fill = Group)) +
++   geom_boxplot(outlier.shape = NA, alpha = 0.8) +
++   geom_jitter(width = 0.15, size = 0.8, alpha = 0.6) +
++   facet_wrap(~ Gene, scales = "free_y") +
++   scale_fill_manual(values = c(Normal = "#2E75B6", Tumor = "#C00000")) +
++   labs(y = "log2(espressione + 1)", x = NULL,
++        title = "Geni con la massima variazione") +
++   theme_bw() + theme(legend.position = "none")
+
+> save_plot(p_bx, "07_boxplot_top_up_down.png", 9, 5)
+
+> #### [SEZ: heatmap]
+> ## ---- 10. CLUSTERING E HEATMAP DEI DEG -------------------------------------
+> deg_mat <- gexpr[deg$Gene, ]
+
+> ann_col <- data.frame(Group = grp, row.names = colnames(deg_mat))
+
+> ann_colors <- list(Group = c(Normal = "#2E75B6", Tumor = "#C00000"))
+
+> # a) tutti i DEG: z-score per riga, distanza di correlazione, legame average
+> pheatmap(deg_mat, scale = "row",
++          clustering_distance_rows = "correlation",
++          clustering_distance_cols = "correlation",
++          clustering_method = "average",
++          color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
++          breaks = seq(-3, 3, length.out = 101),
++          annotation_col = ann_col, annotation_colors = ann_colors,
++          show_rownames = nrow(deg_mat) <= 60, show_colnames = FALSE,
++          main = paste("Heatmap dei", nrow(deg_mat), "DEG"),
++          filename = file.path(OUT_DIR, "08_heatmap_DEG.png"),
++          width = 10, height = 10)
+
+> # b) i 50 DEG con |logFC| maggiore, con i nomi dei geni leggibili
+> top50 <- head(deg$Gene, 50)
+
+> pheatmap(gexpr[top50, ], scale = "row",
++          clustering_distance_rows = "correlation",
++          clustering_distance_cols = "correlation",
++          clustering_method = "average",
++          color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
++          breaks = seq(-3, 3, length.out = 101),
++          annotation_col = ann_col, annotation_colors = ann_colors,
++          show_colnames = FALSE, fontsize_row = 7,
++          main = "Top 50 DEG per |logFC|",
++          filename = file.path(OUT_DIR, "09_heatmap_top50.png"),
++          width = 10, height = 10)
+
+> # raggruppamento dei campioni in 2 cluster e confronto con i gruppi reali
+> hc <- hclust(as.dist(1 - cor(deg_mat)), method = "average")
+
+> cl <- cutree(hc, k = 2)
+
+> print(table(Cluster = cl, Gruppo = grp))
+       Gruppo
+Cluster Normal Tumor
+      1     58     0
+      2      0    58
+
+> #### [SEZ: pca]
+> ## ---- 11. (OPZIONALE) PCA SUI DEG -----------------------------------------
+> pca <- prcomp(t(deg_mat), center = TRUE, scale. = TRUE)
+
+> var_exp <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+
+> pc_df <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], Group = grp)
+
+> p_pca <- ggplot(pc_df, aes(PC1, PC2, colour = Group)) +
++   geom_point(size = 2, alpha = 0.8) +
++   stat_ellipse(level = 0.95, linetype = "dashed") +
++   scale_colour_manual(values = c(Normal = "#2E75B6", Tumor = "#C00000")) +
++   labs(title = "PCA dei campioni sui DEG",
++        x = sprintf("PC1 (%.1f%%)", var_exp[1]),
++        y = sprintf("PC2 (%.1f%%)", var_exp[2])) + theme_bw()
+
+> save_plot(p_pca, "10_PCA_DEG.png", 7, 5.5)
+
+> p_scree <- ggplot(data.frame(PC = 1:10, Var = var_exp[1:10]), aes(PC, Var)) +
++   geom_col(fill = "#2E75B6") + geom_line() + geom_point() +
++   scale_x_continuous(breaks = 1:10) +
++   labs(title = "Scree plot", x = "Componente principale",
++        y = "% varianza spiegata") + theme_bw()
+
+> save_plot(p_scree, "11_scree_plot.png", 6, 4)
+
+> #### [SEZ: export]
+> ## ---- 12. ESPORTAZIONE DEI RISULTATI ---------------------------------------
+> out <- data.frame(Gene       = deg$Gene,
++                   adj.P.Val  = signif(deg$adj.P.Val, 4),
++                   logFC      = round(deg$logFC, 4),
++                   Regulation = ifelse(deg$logFC > 0, "UP", "DOWN"))
+
+> write.table(out, file.path(OUT_DIR, "DEG_GSE32863.txt"),
++             sep = "\t", quote = FALSE, row.names = FALSE)
+
+> # tabella completa (tutti i geni testati) e liste per EnrichR web
+> write.table(res, file.path(OUT_DIR, "risultati_completi_GSE32863.txt"),
++             sep = "\t", quote = FALSE, row.names = FALSE)
+
+> writeLines(out$Gene[out$Regulation == "UP"],
++            file.path(OUT_DIR, "lista_UP.txt"))
+
+> writeLines(out$Gene[out$Regulation == "DOWN"],
++            file.path(OUT_DIR, "lista_DOWN.txt"))
+
+> #### [SEZ: enrichr]
+> ## ---- 13. ANALISI DI ARRICCHIMENTO FUNZIONALE CON ENRICHR ------------------
+> # Richiede connessione internet (API https://maayanlab.cloud/Enrichr).
+> # In alternativa: caricare lista_UP.txt / lista_DOWN.txt sul sito web.
+> run_enrichment <- function(genes, label, dbs) {
++   enr <- enrichR::enrichr(genes, dbs)
++   for (db in names(enr)) {
++     tab <- enr[[db]]
++     if (is.null(tab) || nrow(tab) == 0) next
++     tab <- tab[order(tab$Adjusted.P.value), ]
++     write.table(tab, file.path(OUT_DIR,
++                 paste0("enrichr_", label, "_", db, ".txt")),
++                 sep = "\t", quote = FALSE, row.names = FALSE)
++     top <- head(tab, 15)
++     top$Term <- factor(substr(top$Term, 1, 60),
++                        levels = rev(unique(substr(top$Term, 1, 60))))
++     p <- ggplot(top, aes(-log10(Adjusted.P.value), Term,
++                          size = Combined.Score)) +
++       geom_point(colour = ifelse(label == "UP", "#C00000", "#2E75B6")) +
++       labs(title = paste("EnrichR -", db, "- geni", label),
++            x = "-log10(p-value aggiustato)", y = NULL) + theme_bw()
++     save_plot(p, paste0("12_enrichr_", label, "_", db, ".png"), 10, 6)
++   }
++   invisible(enr)
++ }
+
+> if (requireNamespace("enrichR", quietly = TRUE)) {
++   library(enrichR)
++   setEnrichrSite("Enrichr")
++   dbs <- c("GO_Biological_Process_2023", "KEGG_2021_Human",
++            "Reactome_2022", "WikiPathway_2023_Human")
++   # verificare i nomi disponibili con: enrichR::listEnrichrDbs()
++   enr_up   <- tryCatch(run_enrichment(out$Gene[out$Regulation == "UP"],
++                                       "UP", dbs),
++                        error = function(e) message("EnrichR UP: ", e$message))
++   enr_down <- tryCatch(run_enrichment(out$Gene[out$Regulation == "DOWN"],
++                                       "DOWN", dbs),
++                        error = function(e) message("EnrichR DOWN: ", e$message))
++ } else {
++   message("Pacchetto enrichR non installato: usare il sito web di Enrichr")
++ }
+Uploading data to Enrichr... Done.
+  Querying GO_Biological_Process_2023... Done.
+  Querying KEGG_2021_Human... Done.
+  Querying Reactome_2022... Done.
+  Querying WikiPathway_2023_Human... Done.
+Parsing results... Done.
+Uploading data to Enrichr... Done.
+  Querying GO_Biological_Process_2023... Done.
+  Querying KEGG_2021_Human... Done.
+  Querying Reactome_2022... Done.
+  Querying WikiPathway_2023_Human... Done.
+Parsing results... Done.
+
+> #### [SEZ: paired]
+> ## ---- 14. ANALISI DI SENSIBILITA: TEST t APPAIATO --------------------------
+> # I campioni sono matched-normal: per i pazienti con entrambi i campioni si
+> # puo usare un test t appaiato, che elimina la variabilita tra individui.
+> iT <- match(paired_ids, clin$patient[case]);  colT <- colnames(gexpr)[case][iT]
+
+> iN <- match(paired_ids, clin$patient[ctrl]);  colN <- colnames(gexpr)[ctrl][iN]
+
+> d  <- gexpr[, colT] - gexpr[, colN]           # differenze intra-paziente
+
+> p_pair   <- apply(d, 1, function(x) t.test(x)$p.value)
+
+> padj_pair <- p.adjust(p_pair, method = "BH")
+
+> lfc_pair <- rowMeans(d)
+
+> deg_pair <- names(which(padj_pair < ALPHA & abs(lfc_pair) >= lfc_thr))
+
+> cat("DEG con test appaiato:", length(deg_pair),
++     " - in comune con Welch:", length(intersect(deg_pair, deg$Gene)), "\n")
+DEG con test appaiato: 1364  - in comune con Welch: 1354 
+
+> #### [SEZ: session]
+> ## ---- 15. RIPRODUCIBILITA ----------------------------------------------------
+> writeLines(capture.output(sessionInfo()),
++            file.path(OUT_DIR, "sessionInfo.txt"))
+
+> cat("Analisi completata. Risultati in:", normalizePath(OUT_DIR), "\n")
+Analisi completata. Risultati in: C:\Elaborato_Elementi_Bio\output 
